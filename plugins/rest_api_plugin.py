@@ -1,10 +1,12 @@
 __author__ = 'robertsanders'
 __version__ = "1.0.9"
 
-from airflow.models import DagBag, DagModel
+from airflow.models import DagBag, DagModel, DagRun
 from airflow.plugins_manager import AirflowPlugin
 from airflow import configuration
 from airflow.www.app import csrf
+from airflow.api.common.experimental.mark_tasks import set_dag_run_state_to_failed
+from airflow.utils.db import provide_session
 
 from flask import Blueprint, request, jsonify
 from flask_admin import BaseView as AdminBaseview, expose as admin_expose
@@ -12,12 +14,17 @@ from flask_login import current_user
 from flask_login.mixins import AnonymousUserMixin
 from flask_login.utils import _get_user
 
+import pendulum
+
 from datetime import datetime
 import airflow
 import logging
 import subprocess
 import os
 import socket
+import json
+import pathlib
+import traceback
 from flask_appbuilder import expose as app_builder_expose, BaseView as AppBuilderBaseView, has_access
 from flask_jwt_extended.view_decorators import jwt_required, verify_jwt_in_request
 
@@ -602,6 +609,16 @@ apis_metadata = [
         ]
     },
     {
+        "name": "delete_dag_file",
+        "description": "Delete a DAG File in the Web Server",
+        "airflow_version": "None - Custom API",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_file_path", "description": "The relative path of the dag file in airflow dag directory",
+             "form_input_type": "text", "required": True}
+        ]
+    },
+    {
         "name": "refresh_dag",
         "description": "Refresh a DAG in the Web Server",
         "airflow_version": "None - Custom API",
@@ -617,7 +634,69 @@ apis_metadata = [
         "airflow_version": "None - Custom API",
         "http_method": ["GET", "POST"],
         "arguments": []
-    }
+    },
+    {
+        "name": "get_log",
+        "description": "Get dag run's log",
+        "airflow_version": "None - Custom API",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True},
+            {"name": "task_id", "description": "The id of the task", "form_input_type": "text", "required": True},
+            {"name": "execution_date", "description": "The execution_date of the dag", "form_input_type": "text",
+             "required": True},
+            {"name": "metadata", "description": "The metadata of the query, can be 'null'", "form_input_type": "text",
+             "required": True},
+            {"name": "format", "description": "The format of the log (default json)", "form_input_type": "text",
+             "required": False},
+        ]
+    },
+    {
+        "name": "list_dag_runs",
+        "description": "List dag runs given a DAG id",
+        "airflow_version": "1.10.2 or greater",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True,
+             "cli_end_position": 1},
+            {"name": "no_backfill", "description": "filter all the backfill dagruns given the dag id",
+             "form_input_type": "checkbox", "required": False},
+            {"name": "state", "description": "Only list the dag runs corresponding to the state",
+             "form_input_type": "text", "required": False}
+        ]
+    },
+    {
+        "name": "get_dags",
+        "description": "List dags' states for a list of dag ids",
+        "airflow_version": "None - Custom API",
+        "http_method": ["POST"],
+        "arguments": [],
+        "post_arguments": [
+            {"name": "ids", "description": "post a list of dag ids", "form_input_type": "text", "required": True}
+        ]
+    },
+    {
+        "name": "mark_failed",
+        "description": "Mark a dag run as failed",
+        "airflow_version": "None - Custom API",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True},
+            {"name": "execution_date", "description": "The execution_date of the dag run", "form_input_type": "text",
+             "required": True},
+        ]
+    },
+    {
+        "name": "run_list",
+        "description": "Get a paged list of runs order by execution date",
+        "airflow_version": "None - Custom API",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag", "form_input_type": "text", "required": True},
+            {"name": "page", "description": "The page of the list", "form_input_type": "text", "required": True},
+            {"name": "size", "description": "The size of the list", "form_input_type": "text", "required": True},
+        ]
+    },
 ]
 
 
@@ -650,7 +729,11 @@ def jwt_token_secure(func):
             return func(arg)
         else:
             verify_jwt_in_request()
-            return jwt_required(func(arg))
+            obj = func(arg)
+            if isinstance(obj, tuple):  # response with error code
+                return obj
+            else:
+                return jwt_required(obj)
     return jwt_secure_check
 
 
@@ -861,10 +944,20 @@ class REST_API(get_baseview()):
             final_response = self.rest_api_plugin_version(base_response)
         elif api == "deploy_dag":
             final_response = self.deploy_dag(base_response)
+        elif api == "delete_dag_file":
+            final_response = self.delete_dag_file(base_response)
         elif api == "refresh_dag":
             final_response = self.refresh_dag(base_response)
         elif api == "refresh_all_dags":
             final_response = self.refresh_all_dags(base_response)
+        elif api == "get_log":
+            final_response = self.get_log(base_response)
+        elif api == "get_dags":
+            final_response = self.get_dags(base_response)
+        elif api == "mark_failed":
+            final_response = self.mark_failed(base_response)
+        elif api == "run_list":
+            final_response = self.run_list(base_response)
         else:
             final_response = self.execute_cli(base_response, api_metadata)
 
@@ -1039,6 +1132,39 @@ class REST_API(get_baseview()):
 
         return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG File [{}] has been uploaded".format(dag_file), warning=warning)
 
+    # Custom Function for the delete_dag_file API
+    def delete_dag_file(self, base_response):
+        logging.info("Executing custom 'delete_dag_file' function")
+        dag_file_path = request.args.get('dag_file_path')
+        logging.info("dag file to delete: '" + str(dag_file_path) + "'")
+        if self.is_arg_not_provided(dag_file_path):
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file_path should be provided")
+        elif " " in dag_file_path:
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file_path contains spaces and is therefore an illegal argument")
+
+        # make sure that the dag_file is a python script
+        if dag_file_path and dag_file_path.endswith(".py"):
+            save_file_path = os.path.join(
+                airflow_dags_folder, dag_file_path)
+
+            # Check if the file already exists.
+            if not os.path.isfile(save_file_path):
+                logging.warning("File " + save_file_path + " does not exist")
+                return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' does not exist on host '" + hostname + "'.")
+            try:
+                logging.info("Deleting file '" + save_file_path + "' ...")
+                os.remove(save_file_path)
+            except OSError as e:
+                logging.warning("File " + save_file_path + " deletion failed", e)
+                return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' deletion failed")
+        else:
+            logging.warning(
+                "deploy_dag file is not a python file. It does not end with a .py.")
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file is not a *.py file")
+
+        warning = None
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG File [{}] has been deleted".format(dag_file_path), warning=warning)
+
     # Custom Function for the refresh_dag API
     # This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
     def refresh_dag(self, base_response):
@@ -1094,7 +1220,7 @@ class REST_API(get_baseview()):
                             str(dag_id) + "': " + str(e)
                         logging.error(error_message)
                         return REST_API_Response_Util.get_500_error_response(base_response, error_message)
-                
+
                 output += ("; All DAGs are now refreshed!")
 
         except Exception as e:
@@ -1104,6 +1230,69 @@ class REST_API(get_baseview()):
             return REST_API_Response_Util.get_500_error_response(base_response, error_message)
 
         return REST_API_Response_Util.get_200_response(base_response=base_response, output=str(output))
+
+    def get_log(self, base_response):
+        try:
+            from airflow.www.views import Airflow
+            log = Airflow().get_logs_with_metadata().get_json()['message'][-1]
+        except Exception as e:
+            return REST_API_Response_Util.get_200_response(base_response=base_response, output="No log found")
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output=log)
+
+    def get_dags(self, base_response):
+        try:
+            dag_ids = request.get_json(force=True)
+            dags = []
+            for dag_id in dag_ids:
+                orm_dag = DagModel.get_current(dag_id)
+                dags.append({
+                    "name": dag_id,
+                    "is_active": (not orm_dag.is_paused) if orm_dag is not None else False
+                })
+            output = json.dumps(dags)
+        except Exception as e:
+            error_message = "An error occurred while trying to get dags: " + traceback.format_exc()
+            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output=output)
+
+    def mark_failed(self, base_response):
+        try:
+            dag_id = request.args.get('dag_id')
+            execution_date = request.args.get('execution_date')
+            dag = self.get_dagbag().get_dag(dag_id)
+            execution_date = pendulum.parse(execution_date)
+            new_dag_state = set_dag_run_state_to_failed(dag, execution_date, commit=True)
+        except Exception as e:
+            error_message = "An error occurred while trying to mark failed: " + traceback.format_exc()
+            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output=new_dag_state)
+
+    @provide_session
+    def run_list(self, base_response, session=None):
+        try:
+            dag_id = request.args.get('dag_id')
+            page = int(request.args.get('page'))
+            size = int(request.args.get('size'))
+            DR = DagRun
+            qry = session.query(DR).filter(DR.dag_id == dag_id)
+            total_elements = qry.count()
+            total_pages = (total_elements + size - 1) // size
+            dr = qry.order_by(DR.execution_date.desc()).offset(page * size).limit(size).all()
+            dag_runs = [{
+                'id': run.id,
+                'state': run.state,
+                'execution_date': run.execution_date.isoformat(),
+                'state_date': ((run.start_date or '') and run.start_date.isoformat())}
+                for run in dr]
+            output = json.dumps({
+                'total_elements': total_elements,
+                'total_pages': total_pages,
+                'run_list': dag_runs
+            })
+        except Exception as e:
+            error_message = "An error occurred while trying to list runs: " + traceback.format_exc()
+            return REST_API_Response_Util.get_500_error_response(base_response, error_message)
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output=output)
 
     # Executes the airflow command passed into it in the background so the function isn't tied to the webserver process
     @staticmethod
