@@ -1098,6 +1098,7 @@ class REST_API(get_baseview()):
                 return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' already exists on host '" + hostname + "'.")
 
             logging.info("Saving file to '" + save_file_path + "'")
+            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             dag_file.save(save_file_path)
 
         else:
