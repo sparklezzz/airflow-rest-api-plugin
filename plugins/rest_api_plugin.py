@@ -590,6 +590,20 @@ apis_metadata = [
         ],
     },
     {
+        "name": "delete_dag",
+        "description": "Delete a DAG in the Web Server",
+        "airflow_version": "1.11.0 or greater",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_id", "description": "The id of the dag",
+             "form_input_type": "text", "required": True, "cli_end_position": 1}
+        ],
+        "fixed_arguments": [
+            {"name": "yes",
+             "description": "Do not prompt to confirm reset", "fixed_value": ""}
+        ],
+    },
+    {
         "name": "deploy_dag",
         "description": "Deploy a new DAG File to the DAGs directory",
         "airflow_version": "None - Custom API",
