@@ -25,6 +25,7 @@ import socket
 import json
 import pathlib
 import traceback
+import base64
 from flask_appbuilder import expose as app_builder_expose, BaseView as AppBuilderBaseView, has_access
 from flask_jwt_extended.view_decorators import jwt_required, verify_jwt_in_request
 
@@ -633,6 +634,16 @@ apis_metadata = [
         ]
     },
     {
+        "name": "get_dag_file_content",
+        "description": "Get Encoded Content of a DAG File in the Web Server",
+        "airflow_version": "None - Custom API",
+        "http_method": ["GET", "POST"],
+        "arguments": [
+            {"name": "dag_file_path", "description": "The relative path of the dag file in airflow dag directory",
+             "form_input_type": "text", "required": True}
+        ]
+    },
+    {
         "name": "refresh_dag",
         "description": "Refresh a DAG in the Web Server",
         "airflow_version": "None - Custom API",
@@ -960,6 +971,8 @@ class REST_API(get_baseview()):
             final_response = self.deploy_dag(base_response)
         elif api == "delete_dag_file":
             final_response = self.delete_dag_file(base_response)
+        elif api == "get_dag_file_content":
+            final_response = self.get_dag_file_content(base_response)
         elif api == "refresh_dag":
             final_response = self.refresh_dag(base_response)
         elif api == "refresh_all_dags":
@@ -1179,6 +1192,40 @@ class REST_API(get_baseview()):
 
         warning = None
         return REST_API_Response_Util.get_200_response(base_response=base_response, output="DAG File [{}] has been deleted".format(dag_file_path), warning=warning)
+
+    # Custom Function for the get_dag_file_content API
+    def get_dag_file_content(self, base_response):
+        logging.info("Executing custom 'get_dag_file_content' function")
+        dag_file_path = request.args.get('dag_file_path')
+        logging.info("dag file content to fetch: '" + str(dag_file_path) + "'")
+        if self.is_arg_not_provided(dag_file_path):
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file_path should be provided")
+        elif " " in dag_file_path:
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file_path contains spaces and is therefore an illegal argument")
+
+        # make sure that the dag_file is a python script
+        if dag_file_path and dag_file_path.endswith(".py"):
+            save_file_path = os.path.join(
+                airflow_dags_folder, dag_file_path)
+
+            # Check if the file already exists.
+            if not os.path.isfile(save_file_path):
+                logging.warning("File " + save_file_path + " does not exist")
+                return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' does not exist on host '" + hostname + "'.")
+            try:
+                with open(save_file_path, 'r') as fin:
+                    content = fin.read()
+                    encoded_content = base64.b64encode(content.encode("utf-8")).decode('ascii')
+            except OSError as e:
+                logging.warning("File " + save_file_path + " read failed", e)
+                return REST_API_Response_Util.get_400_error_response(base_response, "The file '" + save_file_path + "' read failed")
+        else:
+            logging.warning(
+                "deploy_dag file is not a python file. It does not end with a .py.")
+            return REST_API_Response_Util.get_400_error_response(base_response, "dag_file is not a *.py file")
+
+        warning = None
+        return REST_API_Response_Util.get_200_response(base_response=base_response, output=encoded_content, warning=warning)
 
     # Custom Function for the refresh_dag API
     # This will call the direct function corresponding to the web endpoint '/admin/airflow/refresh' that already exists in Airflow
